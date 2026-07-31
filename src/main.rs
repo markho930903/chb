@@ -1,10 +1,11 @@
 #[cfg(not(target_os = "macos"))]
-compile_error!("codex-headroom-bridge currently supports macOS only");
+compile_error!("chb currently supports macOS only");
 
 mod config;
 mod fsutil;
 mod macos;
 mod settings;
+mod web;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -15,20 +16,25 @@ use macos::{
 };
 use settings::{Overrides, Settings};
 use std::env;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process;
+
+const INSTALLER_URL: &str = "https://raw.githubusercontent.com/markho930903/chb/main/install.sh";
 
 #[derive(Parser)]
 #[command(
     name = "chb",
     version,
-    about = "Bridge Codex Desktop -> Headroom -> CC Switch."
+    about = "Bridge Codex Desktop -> Headroom -> selected provider."
 )]
 struct Cli {
     #[arg(long, global = true)]
     config: Option<PathBuf>,
     #[arg(long, global = true)]
     cc_db: Option<PathBuf>,
+    #[arg(long, global = true, value_parser = clap::value_parser!(u16).range(1..))]
+    web_port: Option<u16>,
     #[arg(long, global = true, value_parser = clap::value_parser!(u16).range(1..))]
     headroom_port: Option<u16>,
     #[arg(long, global = true, value_parser = clap::value_parser!(u16).range(1..))]
@@ -49,15 +55,17 @@ enum Command {
     Stop,
     Status,
     Doctor,
-    #[command(name = "sync", visible_alias = "reconcile")]
     Sync,
     Watch,
+    #[command(hide = true)]
+    Serve,
     Ui {
         #[arg(long)]
         no_open: bool,
     },
     #[command(name = "rm")]
     Remove,
+    Update,
     Uninstall {
         #[arg(long, help = "Also uninstall Headroom and delete its local data")]
         headroom: bool,
@@ -77,9 +85,15 @@ fn main() {
 
 fn run() -> Result<i32> {
     let cli = Cli::parse();
+    if matches!(&cli.command, Command::Update) {
+        update()?;
+        return Ok(0);
+    }
+
     let settings = Settings::load(Overrides {
         config_path: cli.config,
         cc_db_path: cli.cc_db,
+        web_port: cli.web_port,
         headroom_port: cli.headroom_port,
         cc_port: cli.cc_port,
     })?;
@@ -120,6 +134,7 @@ fn run() -> Result<i32> {
             );
         }
         Command::Watch => watch(&settings)?,
+        Command::Serve => web::serve(&settings)?,
         Command::Ui { no_open } => {
             let url = ui(&settings, no_open)?;
             println!("Dashboard: {url}");
@@ -131,6 +146,7 @@ fn run() -> Result<i32> {
                 settings.state_dir.join("backups").display()
             );
         }
+        Command::Update => unreachable!(),
         Command::Uninstall { headroom } => {
             uninstall(&settings, headroom)?;
             println!(
@@ -142,22 +158,55 @@ fn run() -> Result<i32> {
     Ok(0)
 }
 
+fn update() -> Result<()> {
+    let download = process::Command::new("/usr/bin/curl")
+        .args(["-fsSL", INSTALLER_URL])
+        .output()
+        .context("failed to download update installer")?;
+    if !download.status.success() {
+        let stderr = String::from_utf8_lossy(&download.stderr);
+        anyhow::bail!(
+            "failed to download update installer: {}",
+            stderr.trim().to_owned()
+        );
+    }
+
+    let mut installer = process::Command::new("/bin/sh")
+        .arg("-s")
+        .stdin(process::Stdio::piped())
+        .spawn()
+        .context("failed to start update installer")?;
+    let write_result = installer
+        .stdin
+        .take()
+        .context("update installer stdin is unavailable")?
+        .write_all(&download.stdout)
+        .context("failed to pass update installer to shell");
+    let status = installer.wait().context("failed to run update installer")?;
+    write_result?;
+    if !status.success() {
+        anyhow::bail!("update installer failed with {status}");
+    }
+    Ok(())
+}
+
 fn print_status(data: &macos::RuntimeStatus) {
     let checks = [
         ("Headroom", data.headroom_ready),
-        ("CC Switch proxy", data.cc_switch_ready),
-        ("CC Switch Codex takeover", data.cc_switch_takeover),
+        ("Provider config", data.provider_config_ready()),
         ("Headroom LaunchAgent", data.proxy_service_loaded),
         ("Bridge LaunchAgent", data.bridge_service_loaded),
+        ("CHB Web LaunchAgent", data.web_service_loaded),
         ("Codex route", data.config.route == RouteKind::Bridged),
     ];
     for (name, ok) in checks {
         println!("{:<4}  {name}", if ok { "OK" } else { "FAIL" });
     }
     println!(
-        "      provider={} route={}",
+        "      provider={} route={} upstream={}",
         data.config.provider.as_deref().unwrap_or("None"),
-        data.config.route
+        data.config.route,
+        data.config.upstream.as_deref().unwrap_or("None")
     );
 }
 
@@ -181,7 +230,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn short_commands_and_legacy_aliases_parse() {
+    fn commands_parse() {
+        assert!(matches!(
+            Cli::try_parse_from(["chb", "sync"]).unwrap().command,
+            Command::Sync
+        ));
         assert!(matches!(
             Cli::try_parse_from(["chb", "ui", "--no-open"])
                 .unwrap()
@@ -189,12 +242,16 @@ mod tests {
             Command::Ui { no_open: true }
         ));
         assert!(matches!(
-            Cli::try_parse_from(["chb", "reconcile"]).unwrap().command,
-            Command::Sync
+            Cli::try_parse_from(["chb", "serve"]).unwrap().command,
+            Command::Serve
         ));
         assert!(matches!(
             Cli::try_parse_from(["chb", "rm"]).unwrap().command,
             Command::Remove
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["chb", "update"]).unwrap().command,
+            Command::Update
         ));
         assert!(matches!(
             Cli::try_parse_from(["chb", "uninstall"]).unwrap().command,

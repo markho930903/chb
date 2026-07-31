@@ -3,13 +3,12 @@ use crate::fsutil::atomic_replace_text;
 use crate::settings::Settings;
 use anyhow::{Context, Result, bail};
 use plist::{Dictionary, Value};
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -17,34 +16,33 @@ use std::time::{Duration, Instant};
 
 pub const PROXY_LABEL: &str = "ai.headroom.codex-ccswitch.proxy";
 pub const BRIDGE_LABEL: &str = "ai.headroom.codex-ccswitch.bridge";
+pub const WEB_LABEL: &str = "ai.headroom.codex-ccswitch.web";
 
 pub struct RuntimeStatus {
     pub headroom_ready: bool,
-    pub cc_switch_ready: bool,
-    pub cc_switch_takeover: bool,
     pub proxy_service_loaded: bool,
     pub bridge_service_loaded: bool,
+    pub web_service_loaded: bool,
     pub config: ConfigRoute,
 }
 
 impl RuntimeStatus {
-    pub fn healthy(&self) -> bool {
-        self.headroom_ready
-            && self.cc_switch_ready
-            && self.cc_switch_takeover
-            && self.proxy_service_loaded
-            && self.bridge_service_loaded
-            && self.config.route == RouteKind::Bridged
+    pub fn provider_config_ready(&self) -> bool {
+        self.config.provider.is_some()
+            && !matches!(self.config.route, RouteKind::Missing | RouteKind::Invalid)
     }
-}
 
-pub fn tcp_ready(host: &str, port: u16, timeout: Duration) -> bool {
-    (host, port)
-        .to_socket_addrs()
-        .ok()
-        .into_iter()
-        .flatten()
-        .any(|address| TcpStream::connect_timeout(&address, timeout).is_ok())
+    pub fn proxy_enabled(&self) -> bool {
+        self.proxy_service_loaded && self.bridge_service_loaded
+    }
+
+    pub fn proxy_healthy(&self) -> bool {
+        self.headroom_ready && self.proxy_enabled() && self.config.route == RouteKind::Bridged
+    }
+
+    pub fn healthy(&self) -> bool {
+        self.proxy_healthy() && self.web_service_loaded
+    }
 }
 
 fn http_success(host: &str, port: u16, path: &str, timeout: Duration) -> bool {
@@ -87,33 +85,13 @@ pub fn headroom_ready(settings: &Settings) -> bool {
     )
 }
 
-fn dashboard_ready(settings: &Settings) -> bool {
+fn web_ready(settings: &Settings) -> bool {
     http_success(
-        settings.headroom_host,
-        settings.headroom_port,
-        "/dashboard",
+        settings.web_host,
+        settings.web_port,
+        "/readyz",
         Duration::from_millis(800),
     )
-}
-
-pub fn cc_takeover_enabled(settings: &Settings) -> bool {
-    if !settings.cc_db_path.exists() {
-        return false;
-    }
-    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let result = (|| -> rusqlite::Result<bool> {
-        let connection = Connection::open_with_flags(&settings.cc_db_path, flags)?;
-        connection.busy_timeout(Duration::from_millis(500))?;
-        let enabled = connection
-            .query_row(
-                "SELECT enabled FROM proxy_config WHERE app_type = 'codex'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?;
-        Ok(enabled.is_some_and(|value| value != 0))
-    })();
-    result.unwrap_or(false)
 }
 
 fn uid() -> u32 {
@@ -245,6 +223,38 @@ fn bridge_plist(settings: &Settings, bridge_bin: &Path) -> Result<Value> {
     Ok(Value::Dictionary(data))
 }
 
+fn web_plist(settings: &Settings, bridge_bin: &Path) -> Result<Value> {
+    let mut data = Dictionary::new();
+    data.insert("Label".into(), Value::String(WEB_LABEL.into()));
+    data.insert(
+        "ProgramArguments".into(),
+        string_array(&[path_string(bridge_bin)?, "serve".into()]),
+    );
+    let mut environment = Dictionary::new();
+    environment.insert(
+        "CODEX_HEADROOM_BRIDGE_HOME".into(),
+        Value::String(path_string(&settings.home)?),
+    );
+    environment.insert(
+        "CODEX_HEADROOM_BRIDGE_STATE".into(),
+        Value::String(path_string(&settings.state_dir)?),
+    );
+    data.insert(
+        "EnvironmentVariables".into(),
+        Value::Dictionary(environment),
+    );
+    data.insert(
+        "StandardOutPath".into(),
+        Value::String(path_string(&settings.state_dir.join("web.log"))?),
+    );
+    data.insert(
+        "StandardErrorPath".into(),
+        Value::String(path_string(&settings.state_dir.join("web.err.log"))?),
+    );
+    add_common(&mut data, settings)?;
+    Ok(Value::Dictionary(data))
+}
+
 fn write_plist(path: &Path, value: &Value) -> Result<()> {
     let mut bytes = Vec::new();
     plist::to_writer_xml(&mut bytes, value)?;
@@ -283,6 +293,7 @@ pub fn install_services(
     let services = [
         (PROXY_LABEL, proxy_plist(settings, headroom_bin)?),
         (BRIDGE_LABEL, bridge_plist(settings, bridge_bin)?),
+        (WEB_LABEL, web_plist(settings, bridge_bin)?),
     ];
     for (label, value) in services {
         bootout(label);
@@ -314,7 +325,7 @@ pub fn stop_services(settings: &Settings) -> Result<()> {
     bootout(BRIDGE_LABEL);
     if settings.config_path.exists() {
         reconcile(settings, false)
-            .context("could not restore direct CC Switch routing; Headroom was left running")?;
+            .context("could not restore the selected upstream; Headroom was left running")?;
     }
     bootout(PROXY_LABEL);
     Ok(())
@@ -322,7 +333,8 @@ pub fn stop_services(settings: &Settings) -> Result<()> {
 
 pub fn uninstall_services(settings: &Settings) -> Result<()> {
     stop_services(settings)?;
-    for label in [BRIDGE_LABEL, PROXY_LABEL] {
+    bootout(WEB_LABEL);
+    for label in [WEB_LABEL, BRIDGE_LABEL, PROXY_LABEL] {
         match fs::remove_file(plist_path(settings, label)) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -343,8 +355,6 @@ pub fn uninstall(settings: &Settings, remove_headroom: bool) -> Result<()> {
     uninstall_cargo_bridge(settings)?;
     for path in [
         settings.home.join(".local/bin/chb"),
-        settings.home.join(".local/bin/codex-headroom-bridge"),
-        settings.home.join(".cargo/bin/codex-headroom-bridge"),
         std::env::current_exe().context("failed to locate the running chb executable")?,
     ] {
         remove_file_if_exists(&path)?;
@@ -407,39 +417,10 @@ fn remove_dir_if_exists(path: &Path, home: &Path) -> Result<()> {
 pub fn status(settings: &Settings) -> RuntimeStatus {
     RuntimeStatus {
         headroom_ready: headroom_ready(settings),
-        cc_switch_ready: tcp_ready(
-            settings.cc_host,
-            settings.cc_port,
-            Duration::from_millis(400),
-        ),
-        cc_switch_takeover: cc_takeover_enabled(settings),
         proxy_service_loaded: service_loaded(PROXY_LABEL),
         bridge_service_loaded: service_loaded(BRIDGE_LABEL),
+        web_service_loaded: service_loaded(WEB_LABEL),
         config: config_route(settings),
-    }
-}
-
-#[derive(Debug, Eq, PartialEq)]
-struct WatchDecision {
-    open_cc_switch: bool,
-    bridge: Option<bool>,
-}
-
-fn watch_decision(
-    cc_ready: bool,
-    takeover: bool,
-    headroom_ready: bool,
-    may_open: bool,
-) -> WatchDecision {
-    WatchDecision {
-        open_cc_switch: takeover && !cc_ready && may_open,
-        bridge: if cc_ready && takeover && headroom_ready {
-            Some(true)
-        } else if cc_ready && !headroom_ready {
-            Some(false)
-        } else {
-            None
-        },
     }
 }
 
@@ -447,32 +428,10 @@ pub fn watch(settings: &Settings) -> Result<()> {
     let stopped = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(SIGTERM, Arc::clone(&stopped))?;
     signal_hook::flag::register(SIGINT, Arc::clone(&stopped))?;
-    let mut last_open: Option<Instant> = None;
     let mut last_error = String::new();
 
     while !stopped.load(Ordering::Relaxed) {
-        let cc_ready = tcp_ready(
-            settings.cc_host,
-            settings.cc_port,
-            Duration::from_millis(400),
-        );
-        let takeover = cc_takeover_enabled(settings);
-        let headroom_ready = headroom_ready(settings);
-        let may_open = last_open.is_none_or(|last| last.elapsed() > Duration::from_secs(30));
-        let decision = watch_decision(cc_ready, takeover, headroom_ready, may_open);
-
-        if decision.open_cc_switch {
-            let _ = Command::new("/usr/bin/open")
-                .args(["-gja", "CC Switch"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            last_open = Some(Instant::now());
-        }
-        let result = decision
-            .bridge
-            .map(|bridge| reconcile(settings, bridge))
-            .transpose();
+        let result = reconcile(settings, headroom_ready(settings));
         match result {
             Ok(_) => last_error.clear(),
             Err(error) => {
@@ -489,21 +448,31 @@ pub fn watch(settings: &Settings) -> Result<()> {
 }
 
 pub fn ui(settings: &Settings, no_open: bool) -> Result<String> {
-    if !dashboard_ready(settings) {
-        start_services(settings)?;
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while Instant::now() < deadline && !dashboard_ready(settings) {
+    if !web_ready(settings) {
+        if !plist_path(settings, WEB_LABEL).exists() {
+            bail!("CHB Web service is not installed; run `chb install`");
+        }
+        if service_loaded(WEB_LABEL) {
+            launchctl(
+                &["kickstart".into(), "-k".into(), launch_target(WEB_LABEL)],
+                true,
+            )?;
+        } else {
+            bootstrap(settings, WEB_LABEL)?;
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !web_ready(settings) {
             thread::sleep(Duration::from_millis(200));
         }
-        if !dashboard_ready(settings) {
+        if !web_ready(settings) {
             bail!(
-                "Headroom dashboard did not start; see {}",
-                settings.state_dir.join("headroom.err.log").display()
+                "CHB Web service did not start; see {}",
+                settings.state_dir.join("web.err.log").display()
             );
         }
     }
 
-    let url = format!("{}/dashboard", settings.headroom_origin());
+    let url = settings.web_origin();
     if !no_open {
         let status = Command::new("/usr/bin/open")
             .arg(&url)
@@ -522,52 +491,24 @@ mod tests {
     use std::net::TcpListener;
     use tempfile::TempDir;
 
-    fn settings(root: &Path, port: u16) -> Settings {
+    fn settings(root: &Path, web_port: u16) -> Settings {
         Settings {
             home: root.to_path_buf(),
             config_path: root.join("config.toml"),
             cc_db_path: root.join("cc-switch.db"),
             state_dir: root.join("state"),
             launch_agents_dir: root.join("LaunchAgents"),
+            web_host: "127.0.0.1",
+            web_port,
             headroom_host: "127.0.0.1",
-            headroom_port: port,
+            headroom_port: 8787,
             cc_host: "127.0.0.1",
             cc_port: 15721,
         }
     }
 
     #[test]
-    fn reads_cc_switch_takeover_from_sqlite() {
-        let temp = TempDir::new().unwrap();
-        let settings = settings(temp.path(), 8787);
-        let db = Connection::open(&settings.cc_db_path).unwrap();
-        db.execute(
-            "CREATE TABLE proxy_config (app_type TEXT, enabled INTEGER)",
-            [],
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO proxy_config (app_type, enabled) VALUES ('codex', 1)",
-            [],
-        )
-        .unwrap();
-        drop(db);
-        assert!(cc_takeover_enabled(&settings));
-    }
-
-    #[test]
-    fn takeover_off_never_opens_cc_switch() {
-        assert_eq!(
-            watch_decision(false, false, true, true),
-            WatchDecision {
-                open_cc_switch: false,
-                bridge: None,
-            }
-        );
-    }
-
-    #[test]
-    fn ui_uses_running_headroom_dashboard_without_launchd() {
+    fn ui_uses_running_chb_web_service_without_launchd() {
         let temp = TempDir::new().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -577,13 +518,13 @@ mod tests {
             BufReader::new(stream.try_clone().unwrap())
                 .read_line(&mut line)
                 .unwrap();
-            assert!(line.starts_with("GET /dashboard "));
+            assert!(line.starts_with("GET /readyz "));
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
                 .unwrap();
         });
         let url = ui(&settings(temp.path(), port), true).unwrap();
-        assert_eq!(url, format!("http://127.0.0.1:{port}/dashboard"));
+        assert_eq!(url, format!("http://127.0.0.1:{port}"));
         server.join().unwrap();
     }
 
@@ -605,6 +546,21 @@ mod tests {
                 .and_then(Value::as_string),
             settings.state_dir.to_str()
         );
+    }
+
+    #[test]
+    fn web_launch_agent_runs_the_embedded_server() {
+        let temp = TempDir::new().unwrap();
+        let settings = settings(temp.path(), 9797);
+        let Value::Dictionary(data) = web_plist(&settings, Path::new("/tmp/chb")).unwrap() else {
+            panic!("web plist was not a dictionary");
+        };
+        let arguments = data
+            .get("ProgramArguments")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(arguments[0].as_string(), Some("/tmp/chb"));
+        assert_eq!(arguments[1].as_string(), Some("serve"));
     }
 
     #[test]

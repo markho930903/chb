@@ -40,6 +40,7 @@ impl fmt::Display for RouteKind {
 pub struct ConfigRoute {
     pub provider: Option<String>,
     pub route: RouteKind,
+    pub upstream: Option<String>,
 }
 
 impl ConfigRoute {
@@ -47,6 +48,7 @@ impl ConfigRoute {
         Self {
             provider: None,
             route,
+            upstream: None,
         }
     }
 }
@@ -88,12 +90,15 @@ fn parse_route(settings: &Settings) -> Result<ConfigRoute> {
         .and_then(|key| headers.and_then(|items| items.get(key)))
         .and_then(Item::as_str)
         .map(str::to_owned);
-    let route = if same_url(&base_url, &settings.headroom_base())
-        && same_url(
-            upstream.as_deref().unwrap_or_default(),
-            &settings.cc_origin(),
-        ) {
-        RouteKind::Bridged
+    let route = if same_url(&base_url, &settings.headroom_base()) {
+        if upstream
+            .as_deref()
+            .is_some_and(|url| usable_upstream(url, settings))
+        {
+            RouteKind::Bridged
+        } else {
+            RouteKind::Invalid
+        }
     } else if same_url(&base_url, &settings.cc_base()) {
         RouteKind::CcSwitch
     } else {
@@ -102,6 +107,13 @@ fn parse_route(settings: &Settings) -> Result<ConfigRoute> {
     Ok(ConfigRoute {
         provider: Some(provider),
         route,
+        upstream: if same_url(&base_url, &settings.headroom_base()) {
+            upstream
+        } else if base_url.is_empty() {
+            None
+        } else {
+            Some(base_url)
+        },
     })
 }
 
@@ -156,17 +168,19 @@ fn update_route(doc: &mut DocumentMut, settings: &Settings, bridge: bool) -> Res
     let header = header_key(table.get("http_headers").and_then(Item::as_table_like));
 
     if bridge {
-        if !same_url(&current_base, &settings.cc_base())
-            && !same_url(&current_base, &settings.headroom_base())
-        {
-            bail!(
-                "refusing to bridge unexpected provider URL: {}",
-                if current_base.is_empty() {
-                    "<empty>"
-                } else {
-                    &current_base
-                }
-            );
+        if same_url(&current_base, &settings.headroom_base()) {
+            let upstream = header
+                .as_deref()
+                .and_then(|key| table.get("http_headers")?.as_table_like()?.get(key))
+                .and_then(Item::as_str)
+                .context("Headroom route has no preserved provider URL")?;
+            if usable_upstream(upstream, settings) {
+                return Ok(());
+            }
+            bail!("preserved provider URL cannot be empty or point to Headroom");
+        }
+        if current_base.is_empty() {
+            bail!("refusing to bridge an active provider without a base URL");
         }
         set_value(table, "base_url", Value::from(settings.headroom_base()));
         set_value(table, "supports_websockets", Value::from(false));
@@ -183,18 +197,30 @@ fn update_route(doc: &mut DocumentMut, settings: &Settings, bridge: bool) -> Res
         set_value(
             headers,
             header.as_deref().unwrap_or(BRIDGE_HEADER),
-            Value::from(settings.cc_origin()),
+            Value::from(current_base),
         );
     } else {
-        if !same_url(&current_base, &settings.headroom_base()) && header.is_none() {
+        if !same_url(&current_base, &settings.headroom_base()) {
             return Ok(());
         }
-        set_value(table, "base_url", Value::from(settings.cc_base()));
+        let Some(header) = header else {
+            bail!("Headroom route has no preserved provider URL");
+        };
+        let upstream = table
+            .get("http_headers")
+            .and_then(Item::as_table_like)
+            .and_then(|headers| headers.get(&header))
+            .and_then(Item::as_str)
+            .context("Headroom route has no preserved provider URL")?;
+        if !usable_upstream(upstream, settings) {
+            bail!("preserved provider URL cannot be empty or point to Headroom");
+        }
+        let upstream = upstream.to_owned();
+        set_value(table, "base_url", Value::from(upstream));
         set_value(table, "supports_websockets", Value::from(false));
-        if let Some(header) = header
-            && let Some(headers) = table
-                .get_mut("http_headers")
-                .and_then(Item::as_table_like_mut)
+        if let Some(headers) = table
+            .get_mut("http_headers")
+            .and_then(Item::as_table_like_mut)
         {
             headers.remove(&header);
             if headers.is_empty() {
@@ -222,6 +248,10 @@ fn header_key(headers: Option<&dyn TableLike>) -> Option<String> {
 fn same_url(left: &str, right: &str) -> bool {
     left.trim_end_matches('/')
         .eq_ignore_ascii_case(right.trim_end_matches('/'))
+}
+
+fn usable_upstream(url: &str, settings: &Settings) -> bool {
+    !url.trim().is_empty() && !same_url(url, &settings.headroom_base())
 }
 
 pub fn snapshot(settings: &Settings) -> Result<PathBuf> {
@@ -279,6 +309,8 @@ mod tests {
             cc_db_path: root.join("cc-switch.db"),
             state_dir: root.join("state"),
             launch_agents_dir: root.join("LaunchAgents"),
+            web_host: "127.0.0.1",
+            web_port: 8788,
             headroom_host: "127.0.0.1",
             headroom_port: 8787,
             cc_host: "127.0.0.1",
@@ -292,7 +324,7 @@ model = "gpt-5.6-sol"
 
 [model_providers.custom]
 name = "CCTQ"
-base_url = "http://127.0.0.1:15721/v1" # keep endpoint comment
+base_url = "https://provider.example/v1" # keep endpoint comment
 wire_api = "responses"
 experimental_bearer_token = "PROXY_MANAGED"
 
@@ -314,6 +346,10 @@ memories = true
         assert!(text.contains("experimental_bearer_token = \"PROXY_MANAGED\""));
         assert!(text.contains("memories = true"));
         assert_eq!(config_route(&settings).route, RouteKind::Bridged);
+        assert_eq!(
+            config_route(&settings).upstream.as_deref(),
+            Some("https://provider.example/v1")
+        );
         assert!(!reconcile(&settings, true).unwrap());
     }
 
@@ -325,17 +361,61 @@ memories = true
         let text = fs::read_to_string(&settings.config_path).unwrap();
         assert!(!text.contains(BRIDGE_HEADER));
         assert!(text.contains("experimental_bearer_token = \"PROXY_MANAGED\""));
-        assert_eq!(config_route(&settings).route, RouteKind::CcSwitch);
+        assert!(text.contains("base_url = \"https://provider.example/v1\""));
+        assert_eq!(config_route(&settings).route, RouteKind::Direct);
     }
 
     #[test]
-    fn refuses_unexpected_provider_url() {
+    fn cc_switch_proxy_is_preserved_as_headroom_upstream() {
         let (_temp, settings) = fixture();
         let text = fs::read_to_string(&settings.config_path)
             .unwrap()
-            .replace("http://127.0.0.1:15721/v1", "https://provider.example/v1");
+            .replace("https://provider.example/v1", "http://127.0.0.1:15721/v1");
         fs::write(&settings.config_path, text).unwrap();
+        assert!(reconcile(&settings, true).unwrap());
+        let route = config_route(&settings);
+        assert_eq!(route.route, RouteKind::Bridged);
+        assert_eq!(route.upstream.as_deref(), Some("http://127.0.0.1:15721/v1"));
+
+        assert!(reconcile(&settings, false).unwrap());
+        let text = fs::read_to_string(&settings.config_path).unwrap();
+        assert!(text.contains("base_url = \"http://127.0.0.1:15721/v1\""));
+        assert!(!text.contains(BRIDGE_HEADER));
+    }
+
+    #[test]
+    fn provider_switch_is_captured_after_headroom_is_enabled() {
+        let (_temp, settings) = fixture();
+        reconcile(&settings, true).unwrap();
+        fs::write(
+            &settings.config_path,
+            r#"model_provider = "custom"
+
+[model_providers.custom]
+base_url = "https://another-provider.example/v1"
+wire_api = "responses"
+"#,
+        )
+        .unwrap();
+        assert!(reconcile(&settings, true).unwrap());
+        let text = fs::read_to_string(&settings.config_path).unwrap();
+        assert!(text.contains("base_url = \"http://127.0.0.1:8787/v1\""));
+        assert!(text.contains("X-Headroom-Base-Url = \"https://another-provider.example/v1\""));
+    }
+
+    #[test]
+    fn rejects_headroom_upstream_loop() {
+        let (_temp, settings) = fixture();
+        let text = fs::read_to_string(&settings.config_path)
+            .unwrap()
+            .replace("https://provider.example/v1", "http://127.0.0.1:8787/v1")
+            .replace(
+                "wire_api = \"responses\"",
+                "wire_api = \"responses\"\nhttp_headers = { X-Headroom-Base-Url = \"http://127.0.0.1:8787/v1\" }",
+            );
+        fs::write(&settings.config_path, text).unwrap();
+        assert_eq!(config_route(&settings).route, RouteKind::Invalid);
         let error = reconcile(&settings, true).unwrap_err().to_string();
-        assert!(error.contains("unexpected provider URL"));
+        assert!(error.contains("point to Headroom"));
     }
 }

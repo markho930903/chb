@@ -11,6 +11,7 @@ const MANIFEST_NAME: &str = "settings.toml";
 pub struct Overrides {
     pub config_path: Option<PathBuf>,
     pub cc_db_path: Option<PathBuf>,
+    pub web_port: Option<u16>,
     pub headroom_port: Option<u16>,
     pub cc_port: Option<u16>,
 }
@@ -22,6 +23,8 @@ pub struct Settings {
     pub cc_db_path: PathBuf,
     pub state_dir: PathBuf,
     pub launch_agents_dir: PathBuf,
+    pub web_host: &'static str,
+    pub web_port: u16,
     pub headroom_host: &'static str,
     pub headroom_port: u16,
     pub cc_host: &'static str,
@@ -33,6 +36,7 @@ impl Settings {
         let Overrides {
             config_path,
             cc_db_path,
+            web_port,
             headroom_port,
             cc_port,
         } = overrides;
@@ -66,6 +70,13 @@ impl Settings {
                 .unwrap_or_else(|| home.join(".cc-switch/cc-switch.db"))
         };
 
+        let web_port = if let Some(port) = web_port {
+            port
+        } else if let Some(port) = env_port("CODEX_HEADROOM_BRIDGE_WEB_PORT")? {
+            port
+        } else {
+            manifest_port(&manifest, "web_port")?.unwrap_or(8788)
+        };
         let headroom_port = if let Some(port) = headroom_port {
             port
         } else if let Some(port) = env_port("CODEX_HEADROOM_BRIDGE_HEADROOM_PORT")? {
@@ -87,11 +98,17 @@ impl Settings {
             cc_db_path: absolute(expand_tilde(cc_db_path, &home))?,
             state_dir,
             launch_agents_dir: home.join("Library/LaunchAgents"),
+            web_host: "127.0.0.1",
+            web_port,
             headroom_host: "127.0.0.1",
             headroom_port,
             cc_host: "127.0.0.1",
             cc_port,
         })
+    }
+
+    pub fn web_origin(&self) -> String {
+        format!("http://{}:{}", self.web_host, self.web_port)
     }
 
     pub fn headroom_base(&self) -> String {
@@ -106,15 +123,12 @@ impl Settings {
         format!("http://{}:{}/v1", self.cc_host, self.cc_port)
     }
 
-    pub fn cc_origin(&self) -> String {
-        format!("http://{}:{}", self.cc_host, self.cc_port)
-    }
-
     pub fn save(&self) -> Result<()> {
         let mut doc = DocumentMut::new();
         doc["version"] = value(1);
         doc["config_path"] = value(path_text(&self.config_path)?);
         doc["cc_db_path"] = value(path_text(&self.cc_db_path)?);
+        doc["web_port"] = value(i64::from(self.web_port));
         doc["headroom_port"] = value(i64::from(self.headroom_port));
         doc["cc_port"] = value(i64::from(self.cc_port));
         atomic_replace_text(&self.manifest_path(), None, &doc.to_string(), 0o600)?;
@@ -223,6 +237,7 @@ mod tests {
             env::set_var("CODEX_HEADROOM_BRIDGE_HOME", temp.path());
         }
         let first = Settings::load(Overrides {
+            web_port: Some(9797),
             headroom_port: Some(9898),
             cc_port: Some(16161),
             ..Overrides::default()
@@ -230,6 +245,7 @@ mod tests {
         .unwrap();
         first.save().unwrap();
         let loaded = Settings::load(Overrides::default()).unwrap();
+        assert_eq!(loaded.web_port, 9797);
         assert_eq!(loaded.headroom_port, 9898);
         assert_eq!(loaded.cc_port, 16161);
         // SAFETY: this test serializes all environment access in this module.

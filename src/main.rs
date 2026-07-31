@@ -10,7 +10,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use config::{RouteKind, reconcile};
 use macos::{
-    install_services, start_services, status, stop_services, ui, uninstall_services, watch,
+    install_services, start_services, status, stop_services, ui, uninstall, uninstall_services,
+    watch,
 };
 use settings::{Overrides, Settings};
 use std::env;
@@ -55,8 +56,12 @@ enum Command {
         #[arg(long)]
         no_open: bool,
     },
-    #[command(name = "rm", visible_alias = "uninstall")]
+    #[command(name = "rm")]
     Remove,
+    Uninstall {
+        #[arg(long, help = "Also uninstall Headroom and delete its local data")]
+        headroom: bool,
+    },
 }
 
 fn main() {
@@ -126,6 +131,13 @@ fn run() -> Result<i32> {
                 settings.state_dir.join("backups").display()
             );
         }
+        Command::Uninstall { headroom } => {
+            uninstall(&settings, headroom)?;
+            println!(
+                "Uninstalled CHB{}.",
+                if headroom { " and Headroom" } else { "" }
+            );
+        }
     }
     Ok(0)
 }
@@ -181,8 +193,18 @@ mod tests {
             Command::Sync
         ));
         assert!(matches!(
-            Cli::try_parse_from(["chb", "uninstall"]).unwrap().command,
+            Cli::try_parse_from(["chb", "rm"]).unwrap().command,
             Command::Remove
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["chb", "uninstall"]).unwrap().command,
+            Command::Uninstall { headroom: false }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["chb", "uninstall", "--headroom"])
+                .unwrap()
+                .command,
+            Command::Uninstall { headroom: true }
         ));
     }
 }

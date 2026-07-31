@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-REPO="markho930903/codex-headroom-bridge"
+REPO="markho930903/chb"
 VERSION="${CODEX_HEADROOM_BRIDGE_VERSION:-latest}"
 INSTALL_TMP=""
 NEW_BIN=""
@@ -85,5 +85,14 @@ NEW_LINK=""
 "$BRIDGE_BIN" install \
     --headroom-bin "$HEADROOM_BIN" \
     --bridge-bin "$BRIDGE_BIN"
+
+# Remove a previous local Cargo build so the release binary wins PATH lookup.
+if [ -e "$HOME/.cargo/bin/chb" ]; then
+    if command -v cargo >/dev/null 2>&1; then
+        cargo uninstall codex-headroom-bridge >/dev/null 2>&1 || rm -f "$HOME/.cargo/bin/chb"
+    else
+        rm -f "$HOME/.cargo/bin/chb"
+    fi
+fi
 
 echo "Installed. CC Switch remains unchanged until local routing takeover is enabled."

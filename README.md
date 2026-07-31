@@ -8,7 +8,7 @@ by `uv`.
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/markho930903/codex-headroom-bridge/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/markho930903/chb/main/install.sh | sh
 ```
 
 The installer supports Apple Silicon and Intel macOS, installs `uv` when
@@ -47,6 +47,8 @@ chb stop
 chb start
 chb sync
 chb rm
+chb uninstall
+chb uninstall --headroom
 ```
 
 `ui` starts the installed services when needed, waits for Headroom's local
@@ -54,9 +56,10 @@ dashboard, then opens `http://127.0.0.1:8787/dashboard`. The server stays bound
 to loopback and the bridge does not enable full-message logging.
 
 `rm` removes both LaunchAgents and restores direct routing to the CC Switch
-proxy. The previous `reconcile` and `uninstall` names remain available as
-aliases for `sync` and `rm`. Configuration backups remain under
-`~/.local/state/codex-headroom-bridge/backups/`.
+proxy while keeping CHB and its configuration backups installed. `uninstall`
+also removes CHB binaries and state; pass `--headroom` to additionally remove
+the uv-managed Headroom installation and `~/.headroom` data. The `reconcile`
+name remains available as an alias for `sync`.
 
 The installer also keeps `codex-headroom-bridge` as a compatibility link to
 `chb`; new commands and LaunchAgents use the short name.

@@ -326,6 +326,77 @@ pub fn uninstall_services(settings: &Settings) -> Result<()> {
     Ok(())
 }
 
+pub fn uninstall(settings: &Settings, remove_headroom: bool) -> Result<()> {
+    uninstall_services(settings)?;
+
+    if remove_headroom {
+        uninstall_headroom(settings)?;
+    }
+
+    uninstall_cargo_bridge(settings)?;
+    for path in [
+        settings.home.join(".local/bin/chb"),
+        settings.home.join(".local/bin/codex-headroom-bridge"),
+        settings.home.join(".cargo/bin/codex-headroom-bridge"),
+        std::env::current_exe().context("failed to locate the running chb executable")?,
+    ] {
+        remove_file_if_exists(&path)?;
+    }
+    remove_dir_if_exists(&settings.state_dir, &settings.home)?;
+    Ok(())
+}
+
+fn uninstall_cargo_bridge(settings: &Settings) -> Result<()> {
+    if !settings.home.join(".cargo/bin/chb").exists() {
+        return Ok(());
+    }
+    let cargo = settings.home.join(".cargo/bin/cargo");
+    let status = Command::new(&cargo)
+        .args(["uninstall", env!("CARGO_PKG_NAME")])
+        .status()
+        .with_context(|| format!("failed to run {}", cargo.display()))?;
+    if !status.success() {
+        bail!("cargo could not uninstall CHB");
+    }
+    Ok(())
+}
+
+fn uninstall_headroom(settings: &Settings) -> Result<()> {
+    let tool = settings.home.join(".local/share/uv/tools/headroom-ai");
+    if tool.exists() {
+        let uv = settings.home.join(".local/bin/uv");
+        let status = Command::new(&uv)
+            .args(["tool", "uninstall", "headroom-ai"])
+            .status()
+            .with_context(|| format!("failed to run {}", uv.display()))?;
+        if !status.success() {
+            bail!("uv could not uninstall Headroom");
+        }
+    }
+    remove_file_if_exists(&settings.home.join(".local/bin/headroom"))?;
+    remove_dir_if_exists(&settings.home.join(".headroom"), &settings.home)?;
+    Ok(())
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
+
+fn remove_dir_if_exists(path: &Path, home: &Path) -> Result<()> {
+    if path == home || !path.starts_with(home) {
+        bail!("refusing to remove unsafe directory: {}", path.display());
+    }
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
+
 pub fn status(settings: &Settings) -> RuntimeStatus {
     RuntimeStatus {
         headroom_ready: headroom_ready(settings),
@@ -527,5 +598,15 @@ mod tests {
                 .and_then(Value::as_string),
             settings.state_dir.to_str()
         );
+    }
+
+    #[test]
+    fn directory_cleanup_stays_below_home() {
+        let temp = TempDir::new().unwrap();
+        let owned = temp.path().join("state");
+        fs::create_dir(&owned).unwrap();
+        remove_dir_if_exists(&owned, temp.path()).unwrap();
+        assert!(!owned.exists());
+        assert!(remove_dir_if_exists(temp.path(), temp.path()).is_err());
     }
 }

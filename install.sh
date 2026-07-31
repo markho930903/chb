@@ -84,4 +84,4 @@ if [ -e "$HOME/.cargo/bin/chb" ]; then
     fi
 fi
 
-echo "Installed. CC Switch remains unchanged until local routing takeover is enabled."
+echo "Installed. Use CC Switch normally; its local proxy remains optional."

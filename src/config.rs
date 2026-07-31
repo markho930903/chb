@@ -14,6 +14,7 @@ use time::macros::format_description;
 use toml_edit::{DocumentMut, InlineTable, Item, TableLike, Value};
 
 pub const BRIDGE_HEADER: &str = "X-Headroom-Base-Url";
+const BRIDGE_PATH_HEADER: &str = "X-Headroom-Original-Path";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RouteKind {
@@ -84,7 +85,7 @@ fn parse_route(settings: &Settings) -> Result<ConfigRoute> {
         .unwrap_or_default()
         .to_owned();
     let headers = table.get("http_headers").and_then(Item::as_table_like);
-    let header = header_key(headers);
+    let header = header_key(headers, BRIDGE_HEADER);
     let upstream = header
         .as_deref()
         .and_then(|key| headers.and_then(|items| items.get(key)))
@@ -165,23 +166,27 @@ fn update_route(doc: &mut DocumentMut, settings: &Settings, bridge: bool) -> Res
         .and_then(Item::as_str)
         .unwrap_or_default()
         .to_owned();
-    let header = header_key(table.get("http_headers").and_then(Item::as_table_like));
+    let headers = table.get("http_headers").and_then(Item::as_table_like);
+    let header = header_key(headers, BRIDGE_HEADER);
+    let path_header = header_key(headers, BRIDGE_PATH_HEADER);
 
     if bridge {
-        if same_url(&current_base, &settings.headroom_base()) {
+        let upstream = if same_url(&current_base, &settings.headroom_base()) {
             let upstream = header
                 .as_deref()
                 .and_then(|key| table.get("http_headers")?.as_table_like()?.get(key))
                 .and_then(Item::as_str)
                 .context("Headroom route has no preserved provider URL")?;
-            if usable_upstream(upstream, settings) {
-                return Ok(());
+            if !usable_upstream(upstream, settings) {
+                bail!("preserved provider URL cannot be empty or point to Headroom");
             }
-            bail!("preserved provider URL cannot be empty or point to Headroom");
-        }
-        if current_base.is_empty() {
-            bail!("refusing to bridge an active provider without a base URL");
-        }
+            upstream.to_owned()
+        } else {
+            if current_base.is_empty() {
+                bail!("refusing to bridge an active provider without a base URL");
+            }
+            current_base
+        };
         set_value(table, "base_url", Value::from(settings.headroom_base()));
         set_value(table, "supports_websockets", Value::from(false));
         if table.get("http_headers").is_none() {
@@ -197,7 +202,12 @@ fn update_route(doc: &mut DocumentMut, settings: &Settings, bridge: bool) -> Res
         set_value(
             headers,
             header.as_deref().unwrap_or(BRIDGE_HEADER),
-            Value::from(current_base),
+            Value::from(upstream),
+        );
+        set_value(
+            headers,
+            path_header.as_deref().unwrap_or(BRIDGE_PATH_HEADER),
+            Value::from("/responses"),
         );
     } else {
         if !same_url(&current_base, &settings.headroom_base()) {
@@ -223,6 +233,9 @@ fn update_route(doc: &mut DocumentMut, settings: &Settings, bridge: bool) -> Res
             .and_then(Item::as_table_like_mut)
         {
             headers.remove(&header);
+            if let Some(path_header) = path_header {
+                headers.remove(&path_header);
+            }
             if headers.is_empty() {
                 table.remove("http_headers");
             }
@@ -238,11 +251,10 @@ fn set_value(table: &mut dyn TableLike, key: &str, mut updated: Value) {
     table.insert(key, Item::Value(updated));
 }
 
-fn header_key(headers: Option<&dyn TableLike>) -> Option<String> {
-    headers?.iter().find_map(|(key, _)| {
-        key.eq_ignore_ascii_case(BRIDGE_HEADER)
-            .then(|| key.to_owned())
-    })
+fn header_key(headers: Option<&dyn TableLike>, name: &str) -> Option<String> {
+    headers?
+        .iter()
+        .find_map(|(key, _)| key.eq_ignore_ascii_case(name).then(|| key.to_owned()))
 }
 
 fn same_url(left: &str, right: &str) -> bool {
@@ -345,10 +357,22 @@ memories = true
         assert!(text.contains("# keep endpoint comment"));
         assert!(text.contains("experimental_bearer_token = \"PROXY_MANAGED\""));
         assert!(text.contains("memories = true"));
+        assert!(text.contains("X-Headroom-Original-Path = \"/responses\""));
         assert_eq!(config_route(&settings).route, RouteKind::Bridged);
         assert_eq!(
             config_route(&settings).upstream.as_deref(),
             Some("https://provider.example/v1")
+        );
+
+        let text = fs::read_to_string(&settings.config_path)
+            .unwrap()
+            .replace(", X-Headroom-Original-Path = \"/responses\"", "");
+        fs::write(&settings.config_path, text).unwrap();
+        assert!(reconcile(&settings, true).unwrap());
+        assert!(
+            fs::read_to_string(&settings.config_path)
+                .unwrap()
+                .contains("X-Headroom-Original-Path = \"/responses\"")
         );
         assert!(!reconcile(&settings, true).unwrap());
     }
@@ -360,6 +384,7 @@ memories = true
         assert!(reconcile(&settings, false).unwrap());
         let text = fs::read_to_string(&settings.config_path).unwrap();
         assert!(!text.contains(BRIDGE_HEADER));
+        assert!(!text.contains(BRIDGE_PATH_HEADER));
         assert!(text.contains("experimental_bearer_token = \"PROXY_MANAGED\""));
         assert!(text.contains("base_url = \"https://provider.example/v1\""));
         assert_eq!(config_route(&settings).route, RouteKind::Direct);

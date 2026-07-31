@@ -260,8 +260,15 @@ fn bootout(label: &str) {
 fn bootstrap(settings: &Settings, label: &str) -> Result<()> {
     let domain = format!("gui/{}", uid());
     let path = path_string(&plist_path(settings, label))?;
-    launchctl(&["bootstrap".into(), domain, path], true)?;
-    Ok(())
+    let args = ["bootstrap".into(), domain, path];
+    for attempt in 0..10 {
+        match launchctl(&args, true) {
+            Ok(_) => return Ok(()),
+            Err(_) if attempt < 9 => thread::sleep(Duration::from_millis(100)),
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!()
 }
 
 pub fn install_services(

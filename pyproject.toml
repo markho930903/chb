@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-headroom-bridge"
+version = "0.1.0"
+description = "Route Codex Desktop through Headroom and CC Switch without sharing config ownership."
+requires-python = ">=3.11"
+dependencies = ["tomlkit>=0.13,<1"]
+
+[project.scripts]
+codex-headroom-bridge = "codex_headroom_bridge:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = ["codex_headroom_bridge"]

@@ -38,6 +38,18 @@ the Headroom proxy is stopped. If the CC Switch local proxy is enabled, its
 loopback URL is preserved as Headroom's upstream instead of competing for the
 Codex route. Provider switching remains owned by CC Switch.
 
+## Development
+
+Run the local verification suite from the checkout:
+
+```bash
+make dev
+```
+
+It runs formatting, Clippy, and the test suite. The watcher smoke test uses only
+a temporary configuration and a loopback Headroom substitute, so it does not
+modify the local Codex configuration or install LaunchAgents.
+
 ## Operations
 
 ```bash

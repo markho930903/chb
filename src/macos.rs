@@ -425,26 +425,38 @@ pub fn status(settings: &Settings) -> RuntimeStatus {
 }
 
 pub fn watch(settings: &Settings) -> Result<()> {
-    let stopped = Arc::new(AtomicBool::new(false));
-    signal_hook::flag::register(SIGTERM, Arc::clone(&stopped))?;
-    signal_hook::flag::register(SIGINT, Arc::clone(&stopped))?;
+    let stopped = stop_signal()?;
+    watch_until(settings, &stopped);
+    Ok(())
+}
+
+fn watch_until(settings: &Settings, stopped: &AtomicBool) {
     let mut last_error = String::new();
 
     while !stopped.load(Ordering::Relaxed) {
-        let result = reconcile(settings, headroom_ready(settings));
-        match result {
-            Ok(_) => last_error.clear(),
-            Err(error) => {
-                let message = error.to_string();
-                if message != last_error {
-                    eprintln!("bridge: {message}");
-                    last_error = message;
-                }
-            }
-        }
+        reconcile_with_log(settings, &mut last_error);
         thread::sleep(Duration::from_millis(500));
     }
-    Ok(())
+}
+
+fn stop_signal() -> Result<Arc<AtomicBool>> {
+    let stopped = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(SIGTERM, Arc::clone(&stopped))?;
+    signal_hook::flag::register(SIGINT, Arc::clone(&stopped))?;
+    Ok(stopped)
+}
+
+fn reconcile_with_log(settings: &Settings, last_error: &mut String) {
+    match reconcile(settings, headroom_ready(settings)) {
+        Ok(_) => last_error.clear(),
+        Err(error) => {
+            let message = error.to_string();
+            if message != *last_error {
+                eprintln!("bridge: {message}");
+                *last_error = message;
+            }
+        }
+    }
 }
 
 pub fn ui(settings: &Settings, no_open: bool) -> Result<String> {
@@ -571,5 +583,68 @@ mod tests {
         remove_dir_if_exists(&owned, temp.path()).unwrap();
         assert!(!owned.exists());
         assert!(remove_dir_if_exists(temp.path(), temp.path()).is_err());
+    }
+
+    #[test]
+    fn watch_bridges_and_restores_a_loopback_proxy() {
+        let temp = TempDir::new().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut settings = settings(temp.path(), 8788);
+        settings.headroom_port = port;
+        fs::write(
+            &settings.config_path,
+            "model_provider = \"custom\"\n\n[model_providers.custom]\nbase_url = \"https://provider.example/v1\"\n",
+        )
+        .unwrap();
+        let proxy_stopped = Arc::new(AtomicBool::new(false));
+        let proxy_flag = Arc::clone(&proxy_stopped);
+        let proxy = thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            while !proxy_flag.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut line = String::new();
+                        BufReader::new(stream.try_clone().unwrap())
+                            .read_line(&mut line)
+                            .unwrap();
+                        assert!(line.starts_with("GET /readyz "));
+                        stream
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                            .unwrap();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("fake Headroom failed: {error}"),
+                }
+            }
+        });
+        let watch_stopped = Arc::new(AtomicBool::new(false));
+        let watch_flag = Arc::clone(&watch_stopped);
+        let watch_settings = settings.clone();
+        let watcher = thread::spawn(move || watch_until(&watch_settings, &watch_flag));
+
+        wait_for_route(&settings, RouteKind::Bridged);
+        proxy_stopped.store(true, Ordering::Relaxed);
+        proxy.join().unwrap();
+        wait_for_route(&settings, RouteKind::Direct);
+        watch_stopped.store(true, Ordering::Relaxed);
+        watcher.join().unwrap();
+
+        let text = fs::read_to_string(&settings.config_path).unwrap();
+        assert!(text.contains("base_url = \"https://provider.example/v1\""));
+        assert!(!text.contains("X-Headroom-Base-Url"));
+    }
+
+    fn wait_for_route(settings: &Settings, expected: RouteKind) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if config_route(settings).route == expected {
+                return;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        panic!("route did not become {expected:?}");
     }
 }

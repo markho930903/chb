@@ -8,10 +8,10 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 pub const PROXY_LABEL: &str = "ai.headroom.codex-ccswitch.proxy";
@@ -24,6 +24,109 @@ pub struct RuntimeStatus {
     pub bridge_service_loaded: bool,
     pub web_service_loaded: bool,
     pub config: ConfigRoute,
+}
+
+pub struct DevelopmentProxy {
+    headroom_bin: PathBuf,
+    headroom: Option<Child>,
+    watcher: Option<DevelopmentWatcher>,
+}
+
+struct DevelopmentWatcher {
+    stopped: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
+}
+
+impl DevelopmentProxy {
+    pub fn new(headroom_bin: PathBuf) -> Self {
+        Self {
+            headroom_bin,
+            headroom: None,
+            watcher: None,
+        }
+    }
+
+    pub fn start(&mut self, settings: &Settings) -> Result<()> {
+        if self.running() {
+            return Ok(());
+        }
+        self.stop(settings)?;
+        if headroom_ready(settings) {
+            bail!(
+                "Headroom is already serving {}; stop it or choose --headroom-port",
+                settings.headroom_origin()
+            );
+        }
+
+        self.headroom = Some(
+            Command::new(&self.headroom_bin)
+                .args(["proxy", "--host", settings.headroom_host, "--port"])
+                .arg(settings.headroom_port.to_string())
+                .env("HEADROOM_TELEMETRY", "off")
+                .env("HEADROOM_STRIP_INTERNAL_HEADERS", "enabled")
+                .spawn()
+                .with_context(|| format!("failed to start {}", self.headroom_bin.display()))?,
+        );
+        let startup = self
+            .headroom
+            .as_mut()
+            .context("development Headroom process is unavailable")
+            .and_then(|headroom| wait_for_headroom(settings, headroom))
+            .and_then(|_| reconcile(settings, true).map(|_| ()));
+        if let Err(error) = startup {
+            return match self.stop(settings) {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(error.context(format!("cleanup also failed: {cleanup:#}"))),
+            };
+        }
+
+        let stopped = Arc::new(AtomicBool::new(false));
+        let watch_settings = settings.clone();
+        let watch_flag = Arc::clone(&stopped);
+        let handle = thread::spawn(move || watch_until(&watch_settings, &watch_flag));
+        self.watcher = Some(DevelopmentWatcher { stopped, handle });
+        Ok(())
+    }
+
+    pub fn stop(&mut self, settings: &Settings) -> Result<()> {
+        let active = self.headroom.is_some() || self.watcher.is_some();
+        let watcher = self.watcher.take().map(stop_watcher).unwrap_or(Ok(()));
+        let restore = if active && settings.config_path.exists() {
+            reconcile(settings, false)
+                .map(|_| ())
+                .context("could not restore the selected upstream")
+        } else {
+            Ok(())
+        };
+        let headroom = self.headroom.take().map(stop_headroom).unwrap_or(Ok(()));
+        match (watcher, restore, headroom) {
+            (Ok(()), Ok(()), Ok(())) => Ok(()),
+            (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => Err(error),
+        }
+    }
+
+    pub fn status(&mut self, settings: &Settings) -> RuntimeStatus {
+        if !self.running()
+            && (self.headroom.is_some() || self.watcher.is_some())
+            && let Err(error) = self.stop(settings)
+        {
+            eprintln!("development proxy cleanup: {error:#}");
+        }
+        let running = self.running();
+        RuntimeStatus {
+            headroom_ready: headroom_ready(settings),
+            proxy_service_loaded: running,
+            bridge_service_loaded: running,
+            web_service_loaded: true,
+            config: config_route(settings),
+        }
+    }
+
+    fn running(&mut self) -> bool {
+        self.headroom
+            .as_mut()
+            .is_some_and(|headroom| matches!(headroom.try_wait(), Ok(None)))
+    }
 }
 
 impl RuntimeStatus {
@@ -83,6 +186,41 @@ pub fn headroom_ready(settings: &Settings) -> bool {
         "/readyz",
         Duration::from_millis(800),
     )
+}
+
+fn wait_for_headroom(settings: &Settings, headroom: &mut Child) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = headroom.try_wait()? {
+            bail!("Headroom exited during startup: {status}");
+        }
+        if headroom_ready(settings) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "Headroom did not become ready at {}",
+                settings.headroom_origin()
+            );
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn stop_watcher(watcher: DevelopmentWatcher) -> Result<()> {
+    watcher.stopped.store(true, Ordering::Relaxed);
+    watcher
+        .handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("development bridge watcher panicked"))
+}
+
+fn stop_headroom(mut headroom: Child) -> Result<()> {
+    if headroom.try_wait()?.is_none() {
+        headroom.kill().context("failed to stop Headroom")?;
+        headroom.wait().context("failed to wait for Headroom")?;
+    }
+    Ok(())
 }
 
 fn web_ready(settings: &Settings) -> bool {
@@ -583,6 +721,18 @@ mod tests {
         remove_dir_if_exists(&owned, temp.path()).unwrap();
         assert!(!owned.exists());
         assert!(remove_dir_if_exists(temp.path(), temp.path()).is_err());
+    }
+
+    #[test]
+    fn development_status_uses_the_foreground_web_server() {
+        let temp = TempDir::new().unwrap();
+        let settings = settings(temp.path(), 8788);
+        let mut proxy = DevelopmentProxy::new(PathBuf::from("/bin/false"));
+
+        let status = proxy.status(&settings);
+
+        assert!(status.web_service_loaded);
+        assert!(!status.proxy_enabled());
     }
 
     #[test]

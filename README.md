@@ -43,12 +43,29 @@ Codex route. Provider switching remains owned by CC Switch.
 Run the local verification suite from the checkout:
 
 ```bash
-make dev
+make check
 ```
 
 It runs formatting, Clippy, and the test suite. The watcher smoke test uses only
 a temporary configuration and a loopback Headroom substitute, so it does not
 modify the local Codex configuration or install LaunchAgents.
+
+To manually test Headroom from the dashboard, run:
+
+```bash
+make setup-dev
+make dev
+```
+
+This opens the local CHB dashboard. Its Start and Stop controls manage a
+foreground Headroom process and watcher from the checkout, while `/data` shows
+the proxy statistics. `make setup-dev` installs `uv` only when it is missing,
+then installs the user-level `headroom-ai[all]` tool. `make check-env` reports
+the resolved Headroom path without starting the dashboard. For a nonstandard
+binary, use `make dev HEADROOM_BIN=/path/to/headroom`. `chb doctor` also
+reports missing runtime tools and the direct installation command. The
+development dashboard uses the active Codex configuration, restores its
+upstream on Stop or Ctrl-C, and does not install LaunchAgents.
 
 ## Operations
 

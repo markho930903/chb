@@ -1,9 +1,13 @@
-use crate::macos::{RuntimeStatus, start_services, status, stop_services};
+use crate::macos::{DevelopmentProxy, RuntimeStatus, start_services, status, stop_services};
 use crate::settings::Settings;
 use anyhow::{Context, Result, bail};
+use signal_hook::consts::{SIGINT, SIGTERM};
 use std::fmt::Write as FmtWrite;
-use std::io::{BufRead, BufReader, Read, Write as IoWrite};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write as IoWrite};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::path::Path;
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -11,19 +15,85 @@ use std::time::Duration;
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_HEADROOM_STATS_BYTES: usize = 4 * 1024 * 1024;
 
+#[derive(Clone)]
+enum ServerMode {
+    Installed,
+    Development(Arc<Mutex<DevelopmentProxy>>),
+}
+
 pub fn serve(settings: &Settings) -> Result<()> {
-    let listener =
-        TcpListener::bind((settings.web_host, settings.web_port)).with_context(|| {
-            format!(
-                "failed to bind CHB Web service at {}",
-                settings.web_origin()
-            )
-        })?;
+    serve_listener(
+        bind_listener(settings)?,
+        settings,
+        ServerMode::Installed,
+        None,
+    )
+}
+
+pub fn serve_development(settings: &Settings, headroom_bin: &Path, no_open: bool) -> Result<()> {
+    let listener = bind_listener(settings)?;
+    let proxy = Arc::new(Mutex::new(DevelopmentProxy::new(headroom_bin.into())));
+    if !no_open {
+        let status = Command::new("/usr/bin/open")
+            .arg(settings.web_origin())
+            .status()
+            .context("failed to open development dashboard")?;
+        if !status.success() {
+            bail!("failed to open development dashboard");
+        }
+    }
+    println!("Development dashboard: {}", settings.web_origin());
+
+    let stopped = stop_signal()?;
+    let result = serve_listener(
+        listener,
+        settings,
+        ServerMode::Development(Arc::clone(&proxy)),
+        Some(&stopped),
+    );
+    let cleanup = proxy
+        .lock()
+        .map_err(|_| anyhow::anyhow!("development proxy lock is poisoned"))
+        .and_then(|mut proxy| proxy.stop(settings));
+    match (result, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(error)) | (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(cleanup)) => {
+            Err(error.context(format!("cleanup also failed: {cleanup:#}")))
+        }
+    }
+}
+
+fn bind_listener(settings: &Settings) -> Result<TcpListener> {
+    TcpListener::bind((settings.web_host, settings.web_port)).with_context(|| {
+        format!(
+            "failed to bind CHB Web service at {}",
+            settings.web_origin()
+        )
+    })
+}
+
+fn serve_listener(
+    listener: TcpListener,
+    settings: &Settings,
+    mode: ServerMode,
+    stopped: Option<&AtomicBool>,
+) -> Result<()> {
+    if stopped.is_some() {
+        listener.set_nonblocking(true)?;
+    }
     let action_lock = Arc::new(Mutex::new(()));
 
-    for connection in listener.incoming() {
-        let stream = match connection {
-            Ok(stream) => stream,
+    loop {
+        if stopped.is_some_and(|stopped| stopped.load(Ordering::Relaxed)) {
+            return Ok(());
+        }
+        let stream = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(error) if stopped.is_some() && error.kind() == ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
             Err(error) => {
                 eprintln!("web: failed to accept connection: {error}");
                 continue;
@@ -31,13 +101,20 @@ pub fn serve(settings: &Settings) -> Result<()> {
         };
         let settings = settings.clone();
         let action_lock = Arc::clone(&action_lock);
+        let mode = mode.clone();
         thread::spawn(move || {
-            if let Err(error) = handle_client(stream, &settings, &action_lock) {
+            if let Err(error) = handle_client(stream, &settings, &action_lock, &mode) {
                 eprintln!("web: {error:#}");
             }
         });
     }
-    Ok(())
+}
+
+fn stop_signal() -> Result<Arc<AtomicBool>> {
+    let stopped = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(SIGTERM, Arc::clone(&stopped))?;
+    signal_hook::flag::register(SIGINT, Arc::clone(&stopped))?;
+    Ok(stopped)
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -106,6 +183,7 @@ fn handle_client(
     mut stream: TcpStream,
     settings: &Settings,
     action_lock: &Mutex<()>,
+    mode: &ServerMode,
 ) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(3)))?;
     stream.set_write_timeout(Some(Duration::from_secs(3)))?;
@@ -159,12 +237,20 @@ fn handle_client(
         ("GET", "/readyz") => {
             write_response(&mut stream, "200 OK", "text/plain; charset=utf-8", "ok")
         }
-        ("GET", "/api/status") => write_response(
-            &mut stream,
-            "200 OK",
-            "application/json; charset=utf-8",
-            &status_json(settings, &status(settings)),
-        ),
+        ("GET", "/api/status") => match current_status(settings, mode) {
+            Ok(data) => write_response(
+                &mut stream,
+                "200 OK",
+                "application/json; charset=utf-8",
+                &status_json(settings, &data),
+            ),
+            Err(error) => write_response(
+                &mut stream,
+                "500 Internal Server Error",
+                "application/json; charset=utf-8",
+                &error_json(&format!("{error:#}")),
+            ),
+        },
         ("GET", "/api/headroom/stats") => match fetch_headroom_stats(settings) {
             Ok(body) => write_response(
                 &mut stream,
@@ -191,17 +277,31 @@ fn handle_client(
             let _guard = action_lock
                 .lock()
                 .map_err(|_| anyhow::anyhow!("proxy action lock is poisoned"))?;
-            let result = if request.path.ends_with("/start") {
-                start_services(settings)
-            } else {
-                stop_services(settings)
+            let result = match mode {
+                ServerMode::Installed => {
+                    if request.path.ends_with("/start") {
+                        start_services(settings)
+                    } else {
+                        stop_services(settings)
+                    }
+                }
+                ServerMode::Development(proxy) => {
+                    let mut proxy = proxy
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("development proxy lock is poisoned"))?;
+                    if request.path.ends_with("/start") {
+                        proxy.start(settings)
+                    } else {
+                        proxy.stop(settings)
+                    }
+                }
             };
-            match result {
-                Ok(()) => write_response(
+            match result.and_then(|_| current_status(settings, mode)) {
+                Ok(data) => write_response(
                     &mut stream,
                     "200 OK",
                     "application/json; charset=utf-8",
-                    &status_json(settings, &status(settings)),
+                    &status_json(settings, &data),
                 ),
                 Err(error) => write_response(
                     &mut stream,
@@ -229,6 +329,18 @@ fn handle_client(
             "text/plain; charset=utf-8",
             "Method not allowed",
         ),
+    }
+}
+
+fn current_status(settings: &Settings, mode: &ServerMode) -> Result<RuntimeStatus> {
+    match mode {
+        ServerMode::Installed => Ok(status(settings)),
+        ServerMode::Development(proxy) => {
+            let mut proxy = proxy
+                .lock()
+                .map_err(|_| anyhow::anyhow!("development proxy lock is poisoned"))?;
+            Ok(proxy.status(settings))
+        }
     }
 }
 

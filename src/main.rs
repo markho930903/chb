@@ -58,7 +58,14 @@ enum Command {
     Sync,
     Watch,
     #[command(hide = true)]
-    Serve,
+    Serve {
+        #[arg(long, hide = true)]
+        development: bool,
+        #[arg(long, hide = true)]
+        headroom_bin: Option<PathBuf>,
+        #[arg(long, hide = true)]
+        no_open: bool,
+    },
     Ui {
         #[arg(long)]
         no_open: bool,
@@ -119,7 +126,8 @@ fn run() -> Result<i32> {
             let doctor = matches!(cli.command, Command::Doctor);
             let data = status(&settings);
             print_status(&data);
-            if doctor && !data.healthy() {
+            let environment_ready = if doctor { print_environment() } else { true };
+            if doctor && (!data.healthy() || !environment_ready) {
                 return Ok(1);
             }
         }
@@ -134,7 +142,20 @@ fn run() -> Result<i32> {
             );
         }
         Command::Watch => watch(&settings)?,
-        Command::Serve => web::serve(&settings)?,
+        Command::Serve {
+            development,
+            headroom_bin,
+            no_open,
+        } => {
+            if development {
+                let headroom_bin = headroom_bin.or_else(|| find_program("headroom")).context(
+                    "headroom executable not found; install Headroom or pass --headroom-bin",
+                )?;
+                web::serve_development(&settings, &headroom_bin, no_open)?;
+            } else {
+                web::serve(&settings)?;
+            }
+        }
         Command::Ui { no_open } => {
             let url = ui(&settings, no_open)?;
             println!("Dashboard: {url}");
@@ -210,12 +231,50 @@ fn print_status(data: &macos::RuntimeStatus) {
     );
 }
 
+fn print_environment() -> bool {
+    let uv = find_in_path("uv");
+    let headroom = find_program("headroom");
+    println!("Environment:");
+    for (name, program) in [("uv", &uv), ("Headroom executable", &headroom)] {
+        match program {
+            Some(path) => println!("OK    {name}: {}", path.display()),
+            None => println!("FAIL  {name}"),
+        }
+    }
+    if headroom.is_none() {
+        println!("      Install: uv tool install --python 3.13 \"headroom-ai[all]\"");
+    }
+    headroom.is_some()
+}
+
 fn find_program(name: &str) -> Option<PathBuf> {
+    find_in_path(name).or_else(|| find_in_uv_tool_dir(name))
+}
+
+fn find_in_path(name: &str) -> Option<PathBuf> {
     env::var_os("PATH").and_then(|path| {
-        env::split_paths(&path)
-            .map(|directory| directory.join(name))
-            .find(|candidate| is_executable(candidate))
+        env::split_paths(&path).find_map(|directory| executable_in(&directory, name))
     })
+}
+
+fn find_in_uv_tool_dir(name: &str) -> Option<PathBuf> {
+    let uv = find_in_path("uv")?;
+    let output = process::Command::new(uv)
+        .args(["tool", "dir", "--bin"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let directory = std::str::from_utf8(&output.stdout).ok()?.trim();
+    (!directory.is_empty())
+        .then(|| executable_in(Path::new(directory), name))
+        .flatten()
+}
+
+fn executable_in(directory: &Path, name: &str) -> Option<PathBuf> {
+    let candidate = directory.join(name);
+    is_executable(&candidate).then_some(candidate)
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -228,6 +287,21 @@ fn is_executable(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::TempDir;
+
+    #[test]
+    fn finds_executable_in_tool_directory() {
+        let temp = TempDir::new().unwrap();
+        let executable = temp.path().join("headroom");
+        fs::write(&executable, "#!/bin/sh\n").unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).unwrap();
+
+        assert_eq!(executable_in(temp.path(), "headroom"), Some(executable));
+    }
 
     #[test]
     fn commands_parse() {
@@ -243,7 +317,28 @@ mod tests {
         ));
         assert!(matches!(
             Cli::try_parse_from(["chb", "serve"]).unwrap().command,
-            Command::Serve
+            Command::Serve {
+                development: false,
+                headroom_bin: None,
+                no_open: false,
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "chb",
+                "serve",
+                "--development",
+                "--headroom-bin",
+                "/tmp/headroom",
+                "--no-open",
+            ])
+            .unwrap()
+            .command,
+            Command::Serve {
+                development: true,
+                headroom_bin: Some(_),
+                no_open: true,
+            }
         ));
         assert!(matches!(
             Cli::try_parse_from(["chb", "rm"]).unwrap().command,
